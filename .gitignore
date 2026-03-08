@@ -1,0 +1,20 @@
+# APNs keys — never commit these
+keys/
+*.p8
+
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+
+# Firebase credentials
+GoogleService-Info.plist
+
+# Firebase functions
+functions/node_modules/
+
+# Build artifacts
+DerivedData/
+build/
