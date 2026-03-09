@@ -41,5 +41,332 @@
     .muted { color: #333; font-size: 13px; }
     .row { margin-bottom: 6px; }
     #error { color: #b00000; white-space: pre-wrap; }
-    #status { white-space: pre*
-
+    #status { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Firestore Query Test</h1>
+
+  <div class="box">
+    <h2>1) Login</h2>
+    <div class="row">
+      <label for="email">Email:</label>
+      <input id="email" type="email" size="40" autocomplete="username" />
+    </div>
+    <div class="row">
+      <label for="password">Password:</label>
+      <input id="password" type="password" size="40" autocomplete="current-password" />
+    </div>
+    <div class="row">
+      <button id="loginBtn">Log In</button>
+      <button id="logoutBtn" disabled>Log Out</button>
+    </div>
+    <div class="row muted">Signed in user: <span id="userDisplay">(none)</span></div>
+  </div>
+
+  <div class="box">
+    <h2>2) Query Collection</h2>
+    <div class="row">
+      <label for="collectionName">Collection:</label>
+      <input id="collectionName" type="text" size="40" placeholder="e.g. users" />
+    </div>
+    <div class="row">
+      <label for="batchSize">Batch size:</label>
+      <input id="batchSize" type="number" min="1" value="50" />
+      <span class="muted">(default 50)</span>
+    </div>
+    <div class="row">
+      <button id="startBtn" disabled>Load First Batch</button>
+      <button id="moreBtn" disabled>More</button>
+      <button id="resetBtn">Reset Table</button>
+    </div>
+    <div id="status" class="muted">Status: idle</div>
+    <div id="error"></div>
+  </div>
+
+  <div class="box">
+    <h2>Results</h2>
+    <div class="muted">All discovered fields are shown as columns. Nested objects/arrays are JSON strings.</div>
+    <br />
+    <table id="resultsTable">
+      <thead id="resultsHead"></thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Firebase v10 modular SDK from CDN -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+    import {
+      getAuth,
+      signInWithEmailAndPassword,
+      onAuthStateChanged,
+      signOut
+    } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
+    import {
+      getFirestore,
+      collection,
+      query,
+      orderBy,
+      limit,
+      startAfter,
+      getDocs,
+      documentId
+    } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+
+    /********************************************************************
+     * TODO: REPLACE with your actual web Firebase config
+     ********************************************************************/
+    const firebaseConfig = {
+      apiKey: "REPLACE_ME",
+      authDomain: "REPLACE_ME",
+      projectId: "REPLACE_ME",
+      storageBucket: "REPLACE_ME",
+      messagingSenderId: "REPLACE_ME",
+      appId: "REPLACE_ME"
+    };
+
+    // Init Firebase
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+
+    // DOM refs
+    const emailEl = document.getElementById("email");
+    const passwordEl = document.getElementById("password");
+    const loginBtn = document.getElementById("loginBtn");
+    const logoutBtn = document.getElementById("logoutBtn");
+    const userDisplay = document.getElementById("userDisplay");
+
+    const collectionNameEl = document.getElementById("collectionName");
+    const batchSizeEl = document.getElementById("batchSize");
+    const startBtn = document.getElementById("startBtn");
+    const moreBtn = document.getElementById("moreBtn");
+    const resetBtn = document.getElementById("resetBtn");
+    const statusEl = document.getElementById("status");
+    const errorEl = document.getElementById("error");
+
+    const headEl = document.getElementById("resultsHead");
+    const bodyEl = document.getElementById("resultsBody");
+
+    // Query state
+    let lastVisibleDoc = null;
+    let hasMore = false;
+    let currentCollection = null;
+    let currentBatchSize = 50;
+
+    // Table state
+    const allRows = [];               // array of row objects
+    const allColumns = new Set(["__id"]); // always include doc id
+
+    function setStatus(msg) {
+      statusEl.textContent = "Status: " + msg;
+    }
+
+    function setError(msg) {
+      errorEl.textContent = msg || "";
+    }
+
+    function safeCellValue(v) {
+      if (v === null) return "null";
+      if (v === undefined) return "";
+      if (typeof v === "object") {
+        try { return JSON.stringify(v); } catch { return "[object]"; }
+      }
+      return String(v);
+    }
+
+    function rebuildTable() {
+      const columns = Array.from(allColumns);
+
+      // Header
+      headEl.innerHTML = "";
+      const hr = document.createElement("tr");
+      columns.forEach(c => {
+        const th = document.createElement("th");
+        th.textContent = c;
+        hr.appendChild(th);
+      });
+      headEl.appendChild(hr);
+
+      // Body
+      bodyEl.innerHTML = "";
+      for (const row of allRows) {
+        const tr = document.createElement("tr");
+        for (const c of columns) {
+          const td = document.createElement("td");
+          td.textContent = safeCellValue(row[c]);
+          tr.appendChild(td);
+        }
+        bodyEl.appendChild(tr);
+      }
+    }
+
+    function resetStateAndTable() {
+      lastVisibleDoc = null;
+      hasMore = false;
+      currentCollection = null;
+      allRows.length = 0;
+      allColumns.clear();
+      allColumns.add("__id");
+      rebuildTable();
+      moreBtn.disabled = true;
+      setStatus("idle");
+      setError("");
+    }
+
+    async function fetchBatch({ firstBatch }) {
+      setError("");
+
+      const colName = collectionNameEl.value.trim();
+      const batch = Number(batchSizeEl.value) || 50;
+
+      if (!colName) {
+        setError("Please enter a collection name.");
+        return;
+      }
+      if (batch < 1) {
+        setError("Batch size must be >= 1.");
+        return;
+      }
+
+      // On first batch, set active query settings
+      if (firstBatch) {
+        currentCollection = colName;
+        currentBatchSize = batch;
+        lastVisibleDoc = null;
+        hasMore = false;
+      } else {
+        // enforce consistency across "More" clicks
+        if (colName !== currentCollection) {
+          setError("Collection name changed. Click 'Load First Batch' again.");
+          return;
+        }
+      }
+
+      try {
+        setStatus(`loading ${firstBatch ? "first" : "next"} batch...`);
+
+        const colRef = collection(db, currentCollection);
+
+        // NOTE: ordering by documentId for stable pagination
+        let q;
+        if (lastVisibleDoc) {
+          q = query(
+            colRef,
+            orderBy(documentId()),
+            startAfter(lastVisibleDoc),
+            limit(currentBatchSize)
+          );
+        } else {
+          q = query(
+            colRef,
+            orderBy(documentId()),
+            limit(currentBatchSize)
+          );
+        }
+
+        const snap = await getDocs(q);
+
+        if (snap.empty) {
+          hasMore = false;
+          moreBtn.disabled = true;
+          setStatus(`done. no more results. total rows: ${allRows.length}`);
+          return;
+        }
+
+        // Append rows
+        snap.docs.forEach(docSnap => {
+          const data = docSnap.data() || {};
+          const row = { __id: docSnap.id, ...data };
+          Object.keys(row).forEach(k => allColumns.add(k));
+          allRows.push(row);
+        });
+
+        rebuildTable();
+
+        // Determine pagination state
+        lastVisibleDoc = snap.docs[snap.docs.length - 1];
+        hasMore = snap.size === currentBatchSize;
+        moreBtn.disabled = !hasMore;
+
+        setStatus(
+          `loaded ${snap.size} records. total rows: ${allRows.length}. ` +
+          (hasMore ? "more available." : "end reached.")
+        );
+      } catch (err) {
+        console.error(err);
+        setError("Query failed:\n" + (err?.message || String(err)));
+        setStatus("error");
+      }
+    }
+
+    // Auth handlers
+    loginBtn.addEventListener("click", async () => {
+      setError("");
+      const email = emailEl.value.trim();
+      const password = passwordEl.value;
+
+      if (!email || !password) {
+        setError("Please enter email and password.");
+        return;
+      }
+
+      try {
+        setStatus("logging in...");
+        await signInWithEmailAndPassword(auth, email, password);
+      } catch (err) {
+        console.error(err);
+        setError("Login failed:\n" + (err?.message || String(err)));
+        setStatus("login failed");
+      }
+    });
+
+    logoutBtn.addEventListener("click", async () => {
+      try {
+        await signOut(auth);
+      } catch (err) {
+        console.error(err);
+        setError("Logout failed:\n" + (err?.message || String(err)));
+      }
+    });
+
+    onAuthStateChanged(auth, (user) => {
+      const loggedIn = !!user;
+      userDisplay.textContent = loggedIn ? `${user.email || user.uid}` : "(none)";
+      loginBtn.disabled = loggedIn;
+      logoutBtn.disabled = !loggedIn;
+      startBtn.disabled = !loggedIn;
+      moreBtn.disabled = !loggedIn || !hasMore;
+
+      if (loggedIn) {
+        setStatus("logged in");
+      } else {
+        resetStateAndTable();
+        setStatus("logged out");
+      }
+    });
+
+    // Query buttons
+    startBtn.addEventListener("click", async () => {
+      // start fresh for first batch
+      allRows.length = 0;
+      allColumns.clear();
+      allColumns.add("__id");
+      rebuildTable();
+      await fetchBatch({ firstBatch: true });
+    });
+
+    moreBtn.addEventListener("click", async () => {
+      await fetchBatch({ firstBatch: false });
+    });
+
+    resetBtn.addEventListener("click", () => {
+      resetStateAndTable();
+    });
+
+    // Initial UI
+    resetStateAndTable();
+  </script>
+</body>
+</html>
