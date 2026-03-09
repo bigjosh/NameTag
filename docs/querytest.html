@@ -159,6 +159,105 @@
     const allRows = [];               // array of row objects
     const allColumns = new Set(["__id"]); // always include doc id
 
+    // Inferred location state
+    const INFERRED_LOCATION_COL = "Inferred Location";
+    let tableGeneration = 0;          // incremented on reset; guards stale async callbacks
+    const inferredLocationCache = new Map(); // keyed by "lat,lon" -> Promise<{label,title}>
+
+    // --- Coordinate helpers ---
+    function normalizeCoordinate(v) {
+      if (typeof v === "number") return Number.isFinite(v) ? v : null;
+      if (typeof v === "string" && v.trim() !== "") {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      }
+      return null;
+    }
+
+    function isValidCoordinatePair(lat, lon) {
+      return lat !== null && lon !== null &&
+        lat >= -90 && lat <= 90 &&
+        lon >= -180 && lon <= 180;
+    }
+
+    function makeGoogleMapsUrl(lat, lon) {
+      return `https://www.google.com/maps?q=${encodeURIComponent(`${lat},${lon}`)}`;
+    }
+
+    // --- Reverse geocoding via Nominatim ---
+    let nominatimQueueTail = Promise.resolve();
+
+    function delayMs(ms) {
+      return new Promise(r => setTimeout(r, ms));
+    }
+
+    function enqueueNominatimRequest(fn) {
+      const resultPromise = nominatimQueueTail.then(fn);
+      // After each request settles, enforce a 1-second gap before the next one
+      nominatimQueueTail = resultPromise
+        .then(() => delayMs(1000), () => delayMs(1000));
+      return resultPromise;
+    }
+
+    async function reverseGeocodeLatLon(lat, lon) {
+      const key = `${lat},${lon}`;
+      if (inferredLocationCache.has(key)) return inferredLocationCache.get(key);
+
+      const promise = enqueueNominatimRequest(async () => {
+        const url =
+          `https://nominatim.openstreetmap.org/reverse?format=jsonv2` +
+          `&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}` +
+          `&zoom=14&addressdetails=1`;
+        const res = await fetch(url, {
+          headers: {
+            "Accept": "application/json",
+            "User-Agent": "NameTag-QueryTest/1.0"
+          }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const a = data.address || {};
+        const label =
+          a.attraction || a.tourism || a.building ||
+          a.neighbourhood || a.suburb || a.hamlet ||
+          a.village || a.town || a.city ||
+          a.county || a.state ||
+          data.name || data.display_name ||
+          `${lat}, ${lon}`;
+        return { label, title: data.display_name || label };
+      });
+
+      inferredLocationCache.set(key, promise);
+      return promise;
+    }
+
+    // --- Inferred location cell rendering ---
+    function renderInferredLocationCell(td, row) {
+      td.textContent = "";
+      const info = row[INFERRED_LOCATION_COL];
+      if (info && typeof info === "object" && info.href) {
+        const a = document.createElement("a");
+        a.href = info.href;
+        a.textContent = info.label;
+        if (info.title) a.title = info.title;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        td.appendChild(a);
+      } else if (typeof info === "string") {
+        td.textContent = info;
+      }
+    }
+
+    function updateInferredLocationCell(rowIndex) {
+      const tr = bodyEl.querySelector(`tr[data-row-index="${rowIndex}"]`);
+      if (!tr) return;
+      const columns = Array.from(allColumns);
+      const colIdx = columns.indexOf(INFERRED_LOCATION_COL);
+      if (colIdx === -1) return;
+      const td = tr.cells[colIdx];
+      if (td) renderInferredLocationCell(td, allRows[rowIndex]);
+    }
+
     function setStatus(msg) {
       statusEl.textContent = "Status: " + msg;
     }
@@ -191,11 +290,17 @@
 
       // Body
       bodyEl.innerHTML = "";
-      for (const row of allRows) {
+      for (let i = 0; i < allRows.length; i++) {
+        const row = allRows[i];
         const tr = document.createElement("tr");
+        tr.dataset.rowIndex = i;
         for (const c of columns) {
           const td = document.createElement("td");
-          td.textContent = safeCellValue(row[c]);
+          if (c === INFERRED_LOCATION_COL) {
+            renderInferredLocationCell(td, row);
+          } else {
+            td.textContent = safeCellValue(row[c]);
+          }
           tr.appendChild(td);
         }
         bodyEl.appendChild(tr);
@@ -203,6 +308,7 @@
     }
 
     function resetStateAndTable() {
+      tableGeneration++;
       lastVisibleDoc = null;
       hasMore = false;
       currentCollection = null;
@@ -276,14 +382,52 @@
         }
 
         // Append rows
+        const newRowsWithCoords = []; // { rowIndex, lat, lon } for rows with valid coordinates
+        let hasNewCoords = false;
         snap.docs.forEach(docSnap => {
           const data = docSnap.data() || {};
           const row = { __id: docSnap.id, ...data };
           Object.keys(row).forEach(k => allColumns.add(k));
+          const rowIndex = allRows.length;
           allRows.push(row);
+          const lat = normalizeCoordinate(row.latitude);
+          const lon = normalizeCoordinate(row.longitude);
+          if (isValidCoordinatePair(lat, lon)) {
+            hasNewCoords = true;
+            row[INFERRED_LOCATION_COL] = "Looking up...";
+            newRowsWithCoords.push({ rowIndex, lat, lon });
+          }
         });
 
+        // Add inferred location column (always after regular fields) when any row has coords
+        if (hasNewCoords && !allColumns.has(INFERRED_LOCATION_COL)) {
+          allColumns.add(INFERRED_LOCATION_COL);
+        }
+
         rebuildTable();
+
+        // Kick off async reverse geocoding for new rows that have valid coordinates
+        const gen = tableGeneration;
+        for (const { rowIndex, lat, lon } of newRowsWithCoords) {
+          const row = allRows[rowIndex];
+          reverseGeocodeLatLon(lat, lon).then(geo => {
+            if (tableGeneration !== gen) return;
+            row[INFERRED_LOCATION_COL] = {
+              label: geo.label,
+              href: makeGoogleMapsUrl(lat, lon),
+              title: geo.title
+            };
+            updateInferredLocationCell(rowIndex);
+          }).catch(() => {
+            if (tableGeneration !== gen) return;
+            row[INFERRED_LOCATION_COL] = {
+              label: `${lat}, ${lon}`,
+              href: makeGoogleMapsUrl(lat, lon),
+              title: `${lat}, ${lon}`
+            };
+            updateInferredLocationCell(rowIndex);
+          });
+        }
 
         // Determine pagination state
         lastVisibleDoc = snap.docs[snap.docs.length - 1];
@@ -350,6 +494,7 @@
     // Query buttons
     startBtn.addEventListener("click", async () => {
       // start fresh for first batch
+      tableGeneration++;
       allRows.length = 0;
       allColumns.clear();
       allColumns.add("__id");
