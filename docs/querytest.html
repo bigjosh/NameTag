@@ -68,7 +68,14 @@
     <h2>2) Query Collection</h2>
     <div class="row">
       <label for="collectionName">Collection:</label>
-      <input id="collectionName" type="text" size="40" placeholder="e.g. users" />
+      <select id="collectionName">
+        <option value="users" selected>users</option>
+        <option value="connections">connections</option>
+        <option value="invitations">invitations</option>
+        <option value="conversations">conversations</option>
+        <option value="messages">messages</option>
+        <option value="bannedUsers">bannedUsers</option>
+      </select>
     </div>
     <div class="row">
       <label for="batchSize">Batch size:</label>
